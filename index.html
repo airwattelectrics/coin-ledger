@@ -127,7 +127,7 @@ const RotateCcw = (p) => (
 
 // ---------- helpers ----------
 
-function resizeImageFile(file, maxDim = 900, quality = 0.78) {
+function resizeImageFile(file, maxDim = 1568, quality = 0.9) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("Could not read the file."));
@@ -352,6 +352,11 @@ function CoinLedger() {
 
     try {
       const systemPrompt = `You are a numismatist specialising in Australian coins (decimal and pre-decimal, 1910-present, plus commemorative issues). You are given a photo of the obverse and reverse of a single coin. Identify the coin and assess it, using web search to check current market pricing on sites collectors actually use (eBay AU sold listings, Downies, Coinworks, Australian numismatic dealer sites, PCGS/NGC population data if relevant).
+
+Before answering, work through this verification carefully - misreading small engraved text is the most common mistake, so do not skip it:
+1. Denomination: identify it from the reverse design itself, not from coin size or guesswork. Standard Australian decimal reverse designs: 5c = echidna, 10c = superb lyrebird, 20c = platypus, 50c = coat of arms (round 50c from 1969) or Federation/other commemorative design, $1 = five kangaroos (standard) or a commemorative design, $2 = Aboriginal elder portrait (standard) or a commemorative design. If the design does not clearly match one of these, say so and lower confidence rather than assuming the most common denomination.
+2. Year: the date is small and sits near the portrait on the obverse. Read every digit individually left to right rather than pattern-matching to a "likely" year. If any digit is blurred, worn, or ambiguous, do not guess a specific year - report the digits you can actually confirm and set confidence to "low", noting in sourcesNote which digit(s) were unclear.
+3. Cross-check: the denomination and year you settle on must both be consistent with what is visible in the image. If you are not fully confident in either, reflect that honestly in the confidence field rather than presenting a guess as certain.
 
 Respond with ONLY a single JSON object, no prose before or after, no markdown code fence. Use this exact shape:
 {
