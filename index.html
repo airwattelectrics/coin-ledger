@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Coin Ledger</title>
+<meta name="theme-color" content="#101c18" />
+<link rel="manifest" href="./manifest.json" />
+<link rel="apple-touch-icon" href="./icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<style>
+  html, body { margin: 0; padding: 0; background: #101c18; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // ---------------------------------------------------------------
+  // CONFIG — paste your Cloudflare Worker URL here after deploying it
+  // (see the deployment guide). This proxy is what keeps your
+  // Anthropic API key off the client.
+  // ---------------------------------------------------------------
+  window.CONFIG = {
+    API_ENDPOINT: "https://YOUR-WORKER-SUBDOMAIN.workers.dev",
+  };
+
+  // Storage shim: outside Claude's artifact sandbox, plain localStorage
+  // is the natural, free, zero-backend place to keep the collection.
+  window.storage = {
+    get: async (key) => {
+      try {
+        const v = localStorage.getItem(key);
+        return v === null ? null : { key, value: v, shared: false };
+      } catch (e) {
+        return null;
+      }
+    },
+    set: async (key, value) => {
+      try {
+        localStorage.setItem(key, value);
+        return { key, value, shared: false };
+      } catch (e) {
+        return null;
+      }
+    },
+    delete: async (key) => {
+      try {
+        localStorage.removeItem(key);
+        return { key, deleted: true, shared: false };
+      } catch (e) {
+        return null;
+      }
+    },
+    list: async (prefix) => {
+      try {
+        const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+        return { keys, prefix, shared: false };
+      } catch (e) {
+        return null;
+      }
+    },
+  };
+
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("./sw.js").catch(() => {});
+    });
+  }
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback } = React;
+
+// ---------- tiny inline icon set (no external icon package needed) ----------
+
+function Icon({ size = 18, strokeWidth = 1.6, color = "currentColor", className, style, children, viewBox = "0 0 24 24" }) {
+  return (
+    <svg width={size} height={size} viewBox={viewBox} fill="none" stroke={color}
+      strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round"
+      className={className} style={style}>
+      {children}
+    </svg>
+  );
+}
+const Camera = (p) => (
+  <Icon {...p}>
+    <path d="M3 9a2 2 0 0 1 2-2h1.2a2 2 0 0 0 1.66-.9l.5-.75A2 2 0 0 1 10.06 4h3.88a2 2 0 0 1 1.7 1.35l.5.75a2 2 0 0 0 1.66.9H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+    <circle cx="12" cy="13" r="3.4" />
+  </Icon>
+);
+const Loader2 = (p) => (
+  <Icon {...p}><path d="M21 12a9 9 0 1 1-6.2-8.56" /></Icon>
+);
+const Coins = (p) => (
+  <Icon {...p}>
+    <circle cx="8.5" cy="8.5" r="5.5" />
+    <path d="M14.2 8.2a5.5 5.5 0 1 0 0 8.9" opacity="0.7" />
+  </Icon>
+);
+const Trash2 = (p) => (
+  <Icon {...p}>
+    <path d="M4 7h16" /><path d="M10 11v6" /><path d="M14 11v6" />
+    <path d="M6 7l1 12.5A2 2 0 0 0 9 21h6a2 2 0 0 0 2-1.5L18 7" />
+    <path d="M9 7V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V7" />
+  </Icon>
+);
+const ChevronDown = (p) => (<Icon {...p}><path d="M6 9l6 6 6-6" /></Icon>);
+const ChevronUp = (p) => (<Icon {...p}><path d="M18 15l-6-6-6 6" /></Icon>);
+const AlertCircle = (p) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <line x1="12" y1="7.5" x2="12" y2="13" />
+    <circle cx="12" cy="16.3" r="0.6" fill="currentColor" stroke="none" />
+  </Icon>
+);
+const RotateCcw = (p) => (
+  <Icon {...p}>
+    <path d="M3.5 12a8.5 8.5 0 1 0 2.7-6.2" />
+    <path d="M3.5 4.5v5h5" />
+  </Icon>
+);
+
+// ---------- helpers ----------
+
+function resizeImageFile(file, maxDim = 900, quality = 0.78) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read the file."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Could not decode the image."));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlToBase64(dataUrl) {
+  const idx = dataUrl.indexOf(",");
+  return dataUrl.slice(idx + 1);
+}
+
+function stripCodeFence(text) {
+  return text.replace(/```json/gi, "").replace(/```/g, "").trim();
+}
+
+function formatAUD(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return new Intl.NumberFormat("en-AU", { style: "currency", currency: "AUD", maximumFractionDigits: n < 20 ? 2 : 0 }).format(n);
+}
+
+const STORAGE_KEY = "collection";
+
+// ---------- coin capture slot ----------
+
+function CaptureSlot({ id, label, image, onCapture, onClear, disabled }) {
+  return (
+    <div className="slot">
+      <div className="slot-tap-area">
+        {!disabled && (
+          <input
+            id={id}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={(e) => {
+              const f = e.target.files && e.target.files[0];
+              if (f) onCapture(f);
+              e.target.value = "";
+            }}
+          />
+        )}
+        {image ? (
+          <label htmlFor={id} className={`slot-preview${disabled ? " slot-disabled" : ""}`}>
+            <img src={image} alt={label} />
+          </label>
+        ) : (
+          <label htmlFor={id} className={`slot-empty${disabled ? " slot-disabled" : ""}`}>
+            <Camera size={22} strokeWidth={1.6} />
+            <span>{label}</span>
+          </label>
+        )}
+        {image && (
+          <button
+            type="button"
+            className="slot-clear"
+            onClick={onClear}
+            disabled={disabled}
+            aria-label={`Remove ${label} photo`}
+          >
+            <RotateCcw size={15} />
+          </button>
+        )}
+      </div>
+      <div className="slot-caption">{label}</div>
+    </div>
+  );
+}
+
+// ---------- ledger entry (result / history row) ----------
+
+function LedgerCard({ entry, onDelete, defaultOpen }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  const v = entry.estimatedValueAUD || {};
+  const notIdentified = entry.identified === false;
+
+  return (
+    <div className="ledger-card">
+      <button className="ledger-head" onClick={() => setOpen((o) => !o)}>
+        <div className="ledger-thumbs">
+          {entry.obverseImage && <img src={entry.obverseImage} alt="obverse" />}
+          {entry.reverseImage && <img src={entry.reverseImage} alt="reverse" />}
+        </div>
+        <div className="ledger-head-text">
+          <div className="ledger-title">
+            {notIdentified ? "Not identified" : `${entry.denomination || "Coin"} · ${entry.year || "year unknown"}`}
+          </div>
+          <div className="ledger-sub">
+            {notIdentified
+              ? "Try clearer, well-lit photos"
+              : `${formatAUD(v.low)} – ${formatAUD(v.high)}`}
+          </div>
+        </div>
+        {open ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+        {onDelete && (
+          <span
+            role="button"
+            tabIndex={0}
+            className="ledger-delete"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(entry.id);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.stopPropagation();
+                onDelete(entry.id);
+              }
+            }}
+            aria-label="Remove from collection"
+          >
+            <Trash2 size={15} />
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="ledger-body">
+          {notIdentified ? (
+            <p className="ledger-note">{entry.sourcesNote || "The coin couldn't be confidently identified from these photos."}</p>
+          ) : (
+            <>
+              <dl className="spec-grid">
+                <dt>Series</dt>
+                <dd>{entry.series || "—"}</dd>
+                <dt>Mint mark</dt>
+                <dd>{entry.mintMark || "—"}</dd>
+                <dt>Composition</dt>
+                <dd>{entry.composition || "—"}</dd>
+                <dt>Condition</dt>
+                <dd>{entry.conditionEstimate || "—"}</dd>
+                <dt>Confidence</dt>
+                <dd style={{ textTransform: "capitalize" }}>{entry.confidence || "—"}</dd>
+              </dl>
+
+              {Array.isArray(entry.knownVarietiesOrErrors) && entry.knownVarietiesOrErrors.length > 0 && (
+                <div className="varieties">
+                  <div className="varieties-label">Defects &amp; varieties worth checking for this year</div>
+                  <ul>
+                    {entry.knownVarietiesOrErrors.map((v2, i) => (
+                      <li key={i}>{v2}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {entry.sourcesNote && <p className="ledger-note">{entry.sourcesNote}</p>}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- main app ----------
+
+function CoinLedger() {
+  const [obverseFile, setObverseFile] = useState(null);
+  const [reverseFile, setReverseFile] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState("");
+  const [current, setCurrent] = useState(null);
+  const [collection, setCollection] = useState([]);
+  const [loadingCollection, setLoadingCollection] = useState(true);
+  const [storageBroken, setStorageBroken] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          if (Array.isArray(parsed)) setCollection(parsed);
+        }
+      } catch (e) {
+        // no collection saved yet, or storage unavailable — start empty
+      } finally {
+        setLoadingCollection(false);
+      }
+    })();
+  }, []);
+
+  const persistCollection = useCallback(async (next) => {
+    setCollection(next);
+    try {
+      const result = await window.storage.set(STORAGE_KEY, JSON.stringify(next));
+      if (!result) setStorageBroken(true);
+    } catch (e) {
+      setStorageBroken(true);
+    }
+  }, []);
+
+  const handleAnalyze = async () => {
+    if (!obverseFile || !reverseFile) return;
+    setAnalyzing(true);
+    setError("");
+    setCurrent(null);
+
+    try {
+      const systemPrompt = `You are a numismatist specialising in Australian coins (decimal and pre-decimal, 1910-present, plus commemorative issues). You are given a photo of the obverse and reverse of a single coin. Identify the coin and assess it, using web search to check current market pricing on sites collectors actually use (eBay AU sold listings, Downies, Coinworks, Australian numismatic dealer sites, PCGS/NGC population data if relevant).
+
+Respond with ONLY a single JSON object, no prose before or after, no markdown code fence. Use this exact shape:
+{
+  "identified": boolean,
+  "denomination": string,
+  "series": string,
+  "year": number or null,
+  "mintMark": string,
+  "composition": string,
+  "conditionEstimate": string,
+  "knownVarietiesOrErrors": array of short strings describing specific error types or varieties collectors look for on this denomination/year (e.g. double die, wrong planchet, die crack, muling, rotated die, overdate) - be specific to what's known for this coin, not generic,
+  "hasNotableVariety": boolean,
+  "estimatedValueAUD": { "low": number, "high": number },
+  "confidence": "high" or "medium" or "low",
+  "sourcesNote": string - one or two sentences on what the value estimate is based on and what would change it (e.g. grading, an error being present)
+}
+If the coin cannot be identified from the photos, set identified to false, leave numeric/array fields as null or empty, and explain briefly in sourcesNote what would help (clearer lighting, both sides in focus, etc).`;
+
+      const response = await fetch(window.CONFIG.API_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1200,
+          system: systemPrompt,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "Obverse (front) of the coin:" },
+                { type: "image", source: { type: "base64", media_type: "image/jpeg", data: dataUrlToBase64(obverseFile) } },
+                { type: "text", text: "Reverse (back) of the coin:" },
+                { type: "image", source: { type: "base64", media_type: "image/jpeg", data: dataUrlToBase64(reverseFile) } },
+                { type: "text", text: "Identify this Australian coin and estimate its current value in AUD, per the JSON format in your instructions." },
+              ],
+            },
+          ],
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`The identification service returned an error (${response.status}). If you just deployed, double-check the Worker URL and API key.`);
+      }
+
+      const data = await response.json();
+      const textBlocks = (data.content || []).filter((b) => b.type === "text").map((b) => b.text);
+      const rawText = textBlocks.join("\n");
+      if (!rawText.trim()) {
+        throw new Error("No result came back. Try again with clearer photos.");
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(stripCodeFence(rawText));
+      } catch (e) {
+        throw new Error("Couldn't read the result. Try again — sometimes a retake helps.");
+      }
+
+      const entry = {
+        ...parsed,
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        scannedAt: new Date().toISOString(),
+        obverseImage: obverseFile,
+        reverseImage: reverseFile,
+      };
+
+      setCurrent(entry);
+      await persistCollection([entry, ...collection]);
+      setObverseFile(null);
+      setReverseFile(null);
+    } catch (e) {
+      setError(e.message || "Something went wrong identifying the coin.");
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    const next = collection.filter((c) => c.id !== id);
+    if (current && current.id === id) setCurrent(null);
+    await persistCollection(next);
+  };
+
+  const totalLow = collection.reduce((s, c) => s + (c.estimatedValueAUD?.low || 0), 0);
+  const totalHigh = collection.reduce((s, c) => s + (c.estimatedValueAUD?.high || 0), 0);
+  const identifiedCount = collection.filter((c) => c.identified !== false).length;
+
+  return (
+    <div className="app">
+      <div className="header">
+        <div className="coin-badge">
+          <Coins size={20} color="var(--copper-bright)" strokeWidth={1.6} />
+        </div>
+        <div>
+          <h1>Coin Ledger</h1>
+          <p>Photograph both sides · Australian coins</p>
+        </div>
+      </div>
+
+      <div className="capture-row">
+        <CaptureSlot
+          id="capture-obverse"
+          label="Obverse (front)"
+          image={obverseFile}
+          onCapture={async (f) => setObverseFile(await resizeImageFile(f))}
+          onClear={() => setObverseFile(null)}
+          disabled={analyzing}
+        />
+        <CaptureSlot
+          id="capture-reverse"
+          label="Reverse (back)"
+          image={reverseFile}
+          onCapture={async (f) => setReverseFile(await resizeImageFile(f))}
+          onClear={() => setReverseFile(null)}
+          disabled={analyzing}
+        />
+      </div>
+
+      <button className="analyze-btn" onClick={handleAnalyze} disabled={!obverseFile || !reverseFile || analyzing}>
+        {analyzing ? (
+          <>
+            <Loader2 size={17} className="spin" /> Reading the coin…
+          </>
+        ) : (
+          "Identify this coin"
+        )}
+      </button>
+
+      {error && (
+        <div className="error-box">
+          <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {current && (
+        <>
+          <div className="section-title">Result</div>
+          <LedgerCard entry={current} defaultOpen onDelete={handleDelete} />
+        </>
+      )}
+
+      <div className="section-title">Collection {collection.length > 0 ? `(${collection.length})` : ""}</div>
+      {!loadingCollection && collection.length > 0 && (
+        <div className="summary-row">
+          <span>{identifiedCount} identified</span>
+          <strong>{formatAUD(totalLow)} – {formatAUD(totalHigh)} estimated</strong>
+        </div>
+      )}
+      {loadingCollection ? (
+        <div className="empty-state">Loading your collection…</div>
+      ) : collection.length === 0 ? (
+        <div className="empty-state">Scanned coins will be saved here.</div>
+      ) : (
+        collection
+          .filter((c) => !current || c.id !== current.id)
+          .map((c) => <LedgerCard key={c.id} entry={c} onDelete={handleDelete} />)
+      )}
+      {storageBroken && (
+        <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 10 }}>
+          Your collection couldn&apos;t be saved just now — it&apos;ll still work for this session.
+        </p>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<CoinLedger />);
+</script>
+
+<style>
+  .app {
+    --ink: #101c18;
+    --surface: #17251f;
+    --surface-raised: #1e2f28;
+    --line: #2c4038;
+    --copper: #c1793f;
+    --copper-bright: #d99457;
+    --brass: #c9ab6f;
+    --text: #ece4d4;
+    --text-muted: #93a89c;
+    --danger: #c1613f;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--ink);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 20px 16px 48px;
+    max-width: 560px;
+    margin: 0 auto;
+    box-sizing: border-box;
+  }
+  .app * { box-sizing: border-box; }
+
+  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+  .coin-badge {
+    width: 44px; height: 44px; border-radius: 50%;
+    border: 1.5px solid var(--brass);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    background: radial-gradient(circle at 32% 28%, var(--surface-raised), var(--surface) 70%);
+  }
+  .header h1 {
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    font-size: 22px; font-weight: 600; margin: 0; letter-spacing: 0.2px;
+  }
+  .header p { margin: 2px 0 0; font-size: 13px; color: var(--text-muted); }
+
+  .capture-row { display: flex; gap: 12px; margin-bottom: 14px; }
+  .slot { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .slot-tap-area { position: relative; width: 100%; aspect-ratio: 1; }
+  .slot-tap-area input[type="file"] {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    opacity: 0; cursor: pointer; z-index: 2;
+  }
+  .slot-empty {
+    width: 100%; height: 100%; aspect-ratio: 1;
+    border-radius: 14px; border: 1.5px dashed var(--line);
+    background: var(--surface); color: var(--text-muted);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; font-size: 13px; cursor: pointer; position: absolute; inset: 0;
+  }
+  .slot-tap-area:hover .slot-empty { border-color: var(--copper); color: var(--copper-bright); }
+  .slot-preview {
+    width: 100%; height: 100%; aspect-ratio: 1; border-radius: 14px; overflow: hidden;
+    position: absolute; inset: 0; border: 1.5px solid var(--line);
+    display: block; cursor: pointer;
+  }
+  .slot-preview img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .slot-clear {
+    position: absolute; top: 6px; right: 6px; z-index: 3;
+    background: rgba(16, 28, 24, 0.82); border: 1px solid var(--line); color: var(--text);
+    border-radius: 50%; width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+  }
+  .slot-caption { font-size: 12px; color: var(--text-muted); }
+  .slot-disabled { opacity: 0.5; pointer-events: none; }
+
+  .analyze-btn {
+    width: 100%; padding: 13px; border-radius: 10px; border: none;
+    background: var(--copper); color: #17110a; font-size: 15px; font-weight: 600;
+    cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
+    margin-bottom: 18px;
+  }
+  .analyze-btn:disabled { background: var(--line); color: var(--text-muted); cursor: not-allowed; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .error-box {
+    display: flex; gap: 8px; align-items: flex-start;
+    background: rgba(193, 97, 63, 0.12); border: 1px solid var(--danger); color: #e7bfae;
+    padding: 10px 12px; border-radius: 10px; font-size: 13px; margin-bottom: 18px;
+  }
+
+  .section-title {
+    font-family: Georgia, "Iowan Old Style", serif; font-size: 16px;
+    margin: 26px 0 10px; color: var(--brass);
+  }
+  .summary-row {
+    display: flex; justify-content: space-between; font-size: 12.5px; color: var(--text-muted);
+    margin-bottom: 12px; font-variant-numeric: tabular-nums;
+  }
+  .summary-row strong { color: var(--text); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+  .ledger-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 10px; overflow: hidden; }
+  .ledger-head {
+    width: 100%; background: none; border: none; color: inherit;
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; text-align: left;
+  }
+  .ledger-thumbs { display: flex; flex-shrink: 0; }
+  .ledger-thumbs img { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; border: 1.5px solid var(--surface); margin-left: -10px; }
+  .ledger-thumbs img:first-child { margin-left: 0; }
+  .ledger-head-text { flex: 1; min-width: 0; }
+  .ledger-title { font-size: 14.5px; font-weight: 600; }
+  .ledger-sub { font-size: 13px; color: var(--copper-bright); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .ledger-delete { color: var(--text-muted); padding: 4px; cursor: pointer; display: flex; }
+  .ledger-delete:hover { color: var(--danger); }
+
+  .ledger-body { padding: 4px 14px 16px; border-top: 1px solid var(--line); }
+  .spec-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; margin: 12px 0 4px; }
+  .spec-grid dt { color: var(--text-muted); }
+  .spec-grid dd { margin: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+  .varieties { margin-top: 14px; }
+  .varieties-label { font-size: 12.5px; color: var(--brass); margin-bottom: 6px; }
+  .varieties ul { margin: 0; padding-left: 18px; font-size: 13px; }
+  .varieties li { margin-bottom: 4px; }
+
+  .ledger-note { font-size: 12.5px; color: var(--text-muted); margin-top: 12px; line-height: 1.5; }
+
+  .empty-state { text-align: center; color: var(--text-muted); font-size: 13px; padding: 24px 10px; border: 1px dashed var(--line); border-radius: 12px; }
+</style>
+</body>
+</html>
